@@ -194,6 +194,7 @@ static off_t registeroffset = 0;
 static off_t mem2memdma_register = 0;
 static int quiet = 0;
 static int video_dev = 0;
+static char grab_ffmpeg_http_headers[1024];
 
 /*
  * Runtime request flags used by HiSilicon backends.  Some HI3798
@@ -310,7 +311,9 @@ static inline void clamp_rect(int *L,int *T,int *W,int *H,int outW,int outH)
  * hardware-private layout that is not safely readable as
  * linear YUV from /dev/mem or /dev/videograbber.  DreamOS/FreezeFrame handles
  * this by grabbing one decoded frame from the current service stream with
- * ffmpeg.  Keep the logic inside grab so callers do not need a Python wrapper.
+ * ffmpeg.  IPTV service references are handled by extracting the embedded
+ * http(s) URL before falling back to the local 127.0.0.1:8001 service stream.
+ * Keep the logic inside grab so callers do not need a Python wrapper.
  */
 static int grab_read_text_file(const char *path, char *buf, size_t len)
 {
@@ -338,9 +341,10 @@ static int grab_hexval(int c)
 	return -1;
 }
 
-static void grab_percent_decode_inplace(char *s)
+static int grab_percent_decode_once_inplace(char *s)
 {
 	char *d = s;
+	int changed = 0;
 	while (s && *s)
 	{
 		if (s[0] == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2]))
@@ -349,11 +353,28 @@ static void grab_percent_decode_inplace(char *s)
 			int lo = grab_hexval(s[2]);
 			*d++ = (char)((hi << 4) | lo);
 			s += 3;
+			changed = 1;
 		}
 		else
 			*d++ = *s++;
 	}
 	*d = 0;
+	return changed;
+}
+
+static void grab_percent_decode_inplace(char *s)
+{
+	(void)grab_percent_decode_once_inplace(s);
+}
+
+static void grab_percent_decode_repeat_inplace(char *s, int rounds)
+{
+	int i;
+	for (i = 0; s && *s && i < rounds; ++i)
+	{
+		if (!grab_percent_decode_once_inplace(s))
+			break;
+	}
 }
 
 static void grab_xml_unescape_inplace(char *s)
@@ -446,24 +467,276 @@ static int grab_extract_xml_tag(const char *xml, const char *tag, char *out, siz
 	return out[0] ? 0 : -1;
 }
 
-static int grab_normalize_stream_input(const char *in, char *out, size_t out_len)
+static const char *grab_find_earliest_url_marker(const char *s, int *encoded_marker)
 {
-	char tmp[2048];
-	if (!in || !*in || !out || out_len == 0)
+	const char *markers[] = { "http://", "https://", "http%3a//", "https%3a//" };
+	const int encoded[] = { 0, 0, 1, 1 };
+	const char *best = NULL;
+	int best_encoded = 0;
+	unsigned int i;
+
+	if (encoded_marker)
+		*encoded_marker = 0;
+	if (!s)
+		return NULL;
+
+	for (i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i)
+	{
+		const char *p = strcasestr(s, markers[i]);
+		if (p && (!best || p < best))
+		{
+			best = p;
+			best_encoded = encoded[i];
+		}
+	}
+
+	if (encoded_marker)
+		*encoded_marker = best_encoded;
+	return best;
+}
+
+static void grab_ffmpeg_reset_input_opts(void)
+{
+	grab_ffmpeg_http_headers[0] = 0;
+}
+
+static int grab_strieq(const char *a, const char *b)
+{
+	if (!a || !b)
+		return 0;
+	while (*a && *b)
+	{
+		if (tolower((unsigned char)*a) != tolower((unsigned char)*b))
+			return 0;
+		++a;
+		++b;
+	}
+	return *a == 0 && *b == 0;
+}
+
+static void grab_trim_inplace(char *s)
+{
+	char *e;
+	if (!s)
+		return;
+	while (*s && isspace((unsigned char)*s))
+		memmove(s, s + 1, strlen(s));
+	e = s + strlen(s);
+	while (e > s && isspace((unsigned char)e[-1]))
+		*--e = 0;
+}
+
+static void grab_append_http_header(const char *key, const char *value)
+{
+	size_t used;
+	char safe_value[512];
+	char *p;
+	if (!key || !value || !*value)
+		return;
+
+	/* Allow only headers that are commonly embedded in Enigma2 IPTV service
+	 * references.  Values are sanitized to prevent header injection. */
+	if (!grab_strieq(key, "User-Agent") &&
+	    !grab_strieq(key, "Accept") &&
+	    !grab_strieq(key, "Referer") &&
+	    !grab_strieq(key, "Origin") &&
+	    !grab_strieq(key, "Cookie"))
+		return;
+
+	snprintf(safe_value, sizeof(safe_value), "%s", value);
+	for (p = safe_value; *p; ++p)
+		if (*p == '\r' || *p == '\n')
+			*p = ' ';
+	grab_trim_inplace(safe_value);
+	if (!safe_value[0])
+		return;
+
+	used = strlen(grab_ffmpeg_http_headers);
+	if (used + strlen(key) + strlen(safe_value) + 5 >= sizeof(grab_ffmpeg_http_headers))
+		return;
+	snprintf(grab_ffmpeg_http_headers + used,
+	         sizeof(grab_ffmpeg_http_headers) - used,
+	         "%s: %s\r\n", key, safe_value);
+}
+
+static void grab_parse_iptv_url_options_inplace(char *url)
+{
+	char *opts;
+	char *p;
+	if (!url)
+		return;
+
+	opts = strchr(url, '#');
+	if (!opts)
+		return;
+	*opts++ = 0;
+	grab_percent_decode_repeat_inplace(opts, 4);
+
+	p = opts;
+	while (p && *p)
+	{
+		char *next = strchr(p, '&');
+		char *eq;
+		char key[96];
+		char value[512];
+		if (next)
+			*next++ = 0;
+		eq = strchr(p, '=');
+		if (eq)
+		{
+			*eq++ = 0;
+			snprintf(key, sizeof(key), "%s", p);
+			snprintf(value, sizeof(value), "%s", eq);
+			grab_percent_decode_repeat_inplace(key, 2);
+			grab_percent_decode_repeat_inplace(value, 2);
+			grab_trim_inplace(key);
+			grab_trim_inplace(value);
+			grab_append_http_header(key, value);
+		}
+		p = next;
+	}
+}
+
+static void grab_cut_encoded_url_field_inplace(char *url)
+{
+	/*
+	 * Enigma2 IPTV references usually store the stream URL as one colon field,
+	 * e.g. 4097:...:http%3a//host%3a8080/path:Service Name.
+	 * The scheme and URL-internal colons are percent encoded, so the first
+	 * literal colon after the marker terminates the URL field.
+	 */
+	while (url && *url)
+	{
+		if (*url == ':')
+		{
+			char *q = url + 1;
+			/* Be tolerant of references where only the scheme colon is encoded
+			 * but an URL port is left plain, e.g. http%3a//host:8080/path. */
+			if (isdigit((unsigned char)*q))
+			{
+				while (isdigit((unsigned char)*q))
+					++q;
+				if (*q == '/' || *q == '?' || *q == '&' || *q == '#' || *q == 0)
+				{
+					url = q;
+					continue;
+				}
+			}
+			*url = 0;
+			return;
+		}
+		++url;
+	}
+}
+
+static void grab_cut_plain_embedded_url_inplace(char *url)
+{
+	char *p;
+
+	if (!url)
+		return;
+	p = strstr(url, "://");
+	if (!p)
+		return;
+	p += 3;
+
+	while (*p)
+	{
+		if (*p == ':')
+		{
+			char *q = p + 1;
+			/* Keep a normal URL port such as http://host:8080/path. */
+			if (isdigit((unsigned char)*q))
+			{
+				while (isdigit((unsigned char)*q))
+					++q;
+				if (*q == '/' || *q == '?' || *q == '&' || *q == '#' || *q == 0)
+				{
+					p = q;
+					continue;
+				}
+			}
+			/* Otherwise this is most likely the service-name delimiter. */
+			*p = 0;
+			return;
+		}
+		++p;
+	}
+}
+
+static int grab_extract_embedded_stream_url(const char *sref, char *out, size_t out_len)
+{
+	char work[4096];
+	char url[2048];
+	const char *p;
+	int encoded = 0;
+
+	if (!sref || !out || out_len == 0)
 		return -1;
 
-	snprintf(tmp, sizeof(tmp), "%s", in);
-	grab_xml_unescape_inplace(tmp);
-	grab_percent_decode_inplace(tmp);
+	/* OpenWebif can return IPTV service references double-encoded, for example
+	 * http%253a//host%253a8080/... .  Decode a copy repeatedly before looking
+	 * for the embedded URL so we do not accidentally fall back to
+	 * http://127.0.0.1:8001/<whole service reference>. */
+	snprintf(work, sizeof(work), "%s", sref);
+	grab_xml_unescape_inplace(work);
+	grab_percent_decode_repeat_inplace(work, 4);
 
-	if (!strncmp(tmp, "http://", 7) || !strncmp(tmp, "https://", 8) ||
-	    !strncmp(tmp, "file:", 5) || tmp[0] == '/')
+	p = grab_find_earliest_url_marker(work, &encoded);
+	if (!p)
+		return -1;
+
+	snprintf(url, sizeof(url), "%s", p);
+	if (encoded)
+		grab_cut_encoded_url_field_inplace(url);
+	else
+		grab_cut_plain_embedded_url_inplace(url);
+
+	grab_percent_decode_repeat_inplace(url, 4);
+	grab_parse_iptv_url_options_inplace(url);
+
+	if (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8))
 	{
-		snprintf(out, out_len, "%s", tmp);
+		snprintf(out, out_len, "%s", url);
 		return 0;
 	}
 
-	/* Treat everything else as an Enigma2 service reference. */
+	return -1;
+}
+
+static int grab_normalize_stream_input(const char *in, char *out, size_t out_len)
+{
+	char tmp[4096];
+	char direct[4096];
+	if (!in || !*in || !out || out_len == 0)
+		return -1;
+
+	grab_ffmpeg_reset_input_opts();
+	snprintf(tmp, sizeof(tmp), "%s", in);
+	grab_xml_unescape_inplace(tmp);
+
+	/* Direct URL/path input.  Decode repeatedly because OpenWebif XML may carry
+	 * service references where the path was encoded more than once. */
+	snprintf(direct, sizeof(direct), "%s", tmp);
+	grab_percent_decode_repeat_inplace(direct, 4);
+	if (!strncmp(direct, "http://", 7) || !strncmp(direct, "https://", 8))
+	{
+		grab_parse_iptv_url_options_inplace(direct);
+		snprintf(out, out_len, "%s", direct);
+		return 0;
+	}
+	if (!strncmp(direct, "file:", 5) || direct[0] == '/')
+	{
+		snprintf(out, out_len, "%s", direct);
+		return 0;
+	}
+
+	/* IPTV service references may contain the real http(s) URL as one field. */
+	if (grab_extract_embedded_stream_url(tmp, out, out_len) == 0)
+		return 0;
+
+	/* Treat everything else as an Enigma2 DVB/service reference. */
+	grab_percent_decode_inplace(tmp);
 	snprintf(out, out_len, "http://127.0.0.1:8001/%s", tmp);
 	return 0;
 }
@@ -494,7 +767,14 @@ static int grab_run_argv(char *const argv[])
 		int i;
 		fprintf(stderr, "ffmpeg backend:");
 		for (i = 0; argv[i]; ++i)
-			fprintf(stderr, " %s", argv[i]);
+		{
+			if (i > 0 && !strcmp(argv[i - 1], "-headers"))
+				fprintf(stderr, " <headers>");
+			else if (!strncmp(argv[i], "http://", 7) || !strncmp(argv[i], "https://", 8))
+				fprintf(stderr, " <stream-url>");
+			else
+				fprintf(stderr, " %s", argv[i]);
+		}
 		fprintf(stderr, "\n");
 	}
 
@@ -779,7 +1059,14 @@ static int grab_run_argv_capture_stdout(char *const argv[], unsigned char *buf, 
 		int i;
 		fprintf(stderr, "ffmpeg backend:");
 		for (i = 0; argv[i]; ++i)
-			fprintf(stderr, " %s", argv[i]);
+		{
+			if (i > 0 && !strcmp(argv[i - 1], "-headers"))
+				fprintf(stderr, " <headers>");
+			else if (!strncmp(argv[i], "http://", 7) || !strncmp(argv[i], "https://", 8))
+				fprintf(stderr, " <stream-url>");
+			else
+				fprintf(stderr, " %s", argv[i]);
+		}
 		fprintf(stderr, "\n");
 	}
 
@@ -837,12 +1124,8 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 	char vf[128];
 	const char *loglevel = grab_ffmpeg_loglevel();
 	size_t need;
-	char *argv[] = {
-		"/usr/bin/ffmpeg", "-hide_banner", "-nostdin", "-loglevel", (char *)loglevel,
-		"-an", "-sn", "-dn", "-i", (char *)input,
-		"-map", "0:v:0", "-vf", vf, "-vframes", "1",
-		"-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1", NULL
-	};
+	char *argv[32];
+	int n = 0;
 
 	if (!input || !video || out_w <= 0 || out_h <= 0 || out_w > 1920 || out_h > 1080)
 		return -1;
@@ -852,6 +1135,35 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 		return -1;
 
 	grab_make_ffmpeg_scale_fast(vf, sizeof(vf), out_w, out_h, wait_for_clean_frame);
+
+	argv[n++] = "/usr/bin/ffmpeg";
+	argv[n++] = "-hide_banner";
+	argv[n++] = "-nostdin";
+	argv[n++] = "-loglevel";
+	argv[n++] = (char *)loglevel;
+	if (grab_ffmpeg_http_headers[0])
+	{
+		argv[n++] = "-headers";
+		argv[n++] = grab_ffmpeg_http_headers;
+	}
+	argv[n++] = "-an";
+	argv[n++] = "-sn";
+	argv[n++] = "-dn";
+	argv[n++] = "-i";
+	argv[n++] = (char *)input;
+	argv[n++] = "-map";
+	argv[n++] = "0:v:0";
+	argv[n++] = "-vf";
+	argv[n++] = vf;
+	argv[n++] = "-vframes";
+	argv[n++] = "1";
+	argv[n++] = "-f";
+	argv[n++] = "rawvideo";
+	argv[n++] = "-pix_fmt";
+	argv[n++] = "bgr24";
+	argv[n++] = "pipe:1";
+	argv[n++] = NULL;
+
 	return grab_run_argv_capture_stdout(argv, video, need);
 }
 
@@ -893,7 +1205,7 @@ static int grab_ffmpeg_getvideo_frame(unsigned char *video, int *xres, int *yres
 		out_h++;
 
 	if (!quiet)
-		fprintf(stderr, "ffmpeg backend: input=%s output=%dx%d target=internal-bgr24\n", input, out_w, out_h);
+		fprintf(stderr, "ffmpeg backend: input=<stream-url> output=%dx%d target=internal-bgr24%s\n", out_w, out_h, grab_ffmpeg_http_headers[0] ? " headers=yes" : "");
 
 	/* Fast path first: no fps=1/2 throttle.  If the live HEVC join starts before
 	 * a clean access unit, retry once with the slower DreamOS-style wait filter. */
@@ -1101,7 +1413,7 @@ static int grab_ffmpeg_snapshot(const char *filename, int video_only, int osd_on
 		out_h++;
 
 	if (!quiet)
-		fprintf(stderr, "ffmpeg backend: input=%s output=%dx%d file=%s\n", input, out_w, out_h, filename);
+		fprintf(stderr, "ffmpeg backend: input=<stream-url> output=%dx%d file=%s%s\n", out_w, out_h, filename, grab_ffmpeg_http_headers[0] ? " headers=yes" : "");
 
 	if (video_only)
 		return grab_ffmpeg_one_video(input, filename, out_w, out_h, use_png, use_jpg, jpg_quality);
