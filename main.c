@@ -991,6 +991,28 @@ static int grab_current_video_is_hevc(void)
 	return grab_current_codec_is_hevc() || grab_current_service_type_is_hevc();
 }
 
+static int grab_current_service_is_iptv(void)
+{
+	char body[8192];
+	char sref[2048];
+	char work[4096];
+
+	if (grab_http_get_local80("/web/getcurrent", body, sizeof(body)) < 0 ||
+	    grab_extract_xml_tag(body, "e2servicereference", sref, sizeof(sref)) < 0)
+		return 0;
+
+	/* IPTV service references usually embed the real stream URL as one field.
+	 * It may be percent-encoded more than once, e.g. http%253a//... .
+	 * Detect that without normalizing the global ffmpeg input options here;
+	 * the real extraction and header parsing still happens later in
+	 * grab_get_current_stream_input(). */
+	snprintf(work, sizeof(work), "%s", sref);
+	grab_xml_unescape_inplace(work);
+	grab_percent_decode_repeat_inplace(work, 4);
+
+	return grab_find_earliest_url_marker(work, NULL) != NULL;
+}
+
 static int grab_current_video_is_dmnew_sd576(int w, int h)
 {
 	/* DreamOne/DreamTwo still have a second native-grabber corner case on
@@ -1005,9 +1027,11 @@ static int grab_ffmpeg_backend_should_autouse(int *src_w, int *src_h)
 {
 	int w = 0, h = 0;
 	int hevc;
+	int iptv;
 	int dmnew_sd576;
 	grab_read_current_video_size(&w, &h);
 	hevc = grab_current_video_is_hevc();
+	iptv = grab_current_service_is_iptv();
 	dmnew_sd576 = grab_current_video_is_dmnew_sd576(w, h);
 	if (src_w) *src_w = w;
 	if (src_h) *src_h = h;
@@ -1018,8 +1042,13 @@ static int grab_ffmpeg_backend_should_autouse(int *src_w, int *src_h)
 	 * 1920x1080 services are HEVC and fail through the raw grab paths too.
 	 * On DreamOne/DreamTwo also route PAL SD 720x576-like services through
 	 * ffmpeg, because the native /dev/videograbber path can return corrupted
-	 * SD frames there as well. */
-	if ((stb_type == BRCM7439 || stb_type == DMNEW) && (w > 1920 || h > 1080 || hevc || dmnew_sd576))
+	 * SD frames there as well.
+	 * On DM900/DM920 also route IPTV service references through ffmpeg.
+	 * Some IPTV services do not expose enough reliable decoder metadata early
+	 * enough for the raw BRCM7439 path decision, while the direct stream URL
+	 * can be decoded cleanly by ffmpeg. */
+	if ((stb_type == BRCM7439 || stb_type == DMNEW) &&
+	    (w > 1920 || h > 1080 || hevc || dmnew_sd576 || (stb_type == BRCM7439 && iptv)))
 		return 1;
 
 	return 0;
@@ -2019,7 +2048,7 @@ int main(int argc, char **argv)
 			if ((src_w > 1920 || src_h > 1080) && (!width || width > 1920))
 				width = 1920;
 			if (!quiet)
-				fprintf(stderr, "Using ffmpeg backend for Dream HEVC/UHD/SD video capture ...\n");
+				fprintf(stderr, "Using ffmpeg backend for Dream HEVC/UHD/SD/IPTV video capture ...\n");
 		}
 	}
 
@@ -2078,7 +2107,7 @@ int main(int argc, char **argv)
 		if (use_ffmpeg_video_backend)
 		{
 			if (grab_ffmpeg_getvideo_frame(video, &xres_v, &yres_v, width, NULL) < 0)
-				fprintf(stderr, "ffmpeg backend failed; refusing unsafe raw HEVC/UHD/SD video grab\n");
+				fprintf(stderr, "ffmpeg backend failed; refusing unsafe raw HEVC/UHD/SD/IPTV video grab\n");
 		}
 		else if (stb_type == BRCM7366 || stb_type == BRCM7251 || stb_type == BRCM7252 || stb_type == BRCM7252S || stb_type == BRCM7444 || stb_type == BRCM72604VU || stb_type == BRCM7278 || stb_type == HISIL_ARM)
 		{
