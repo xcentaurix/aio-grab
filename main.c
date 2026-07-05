@@ -136,6 +136,11 @@ int timeval_subtract (struct timeval *result, struct timeval *x, struct timeval 
 #endif
 
 #define VIDEO_DEV "/dev/video"
+#define E2EGL_CAPTURE_SOCKET "/tmp/e2egl-osd.socket"
+#define E2EGL_CAPTURE_FORMAT_BGRA 1U
+#define E2EGL_CAPTURE_MAX_WIDTH 3840U
+#define E2EGL_CAPTURE_MAX_HEIGHT 2160U
+#define E2EGL_CAPTURE_MAX_PIXELS (E2EGL_CAPTURE_MAX_WIDTH * E2EGL_CAPTURE_MAX_HEIGHT)
 
 // dont change SPARE_RAM and DMA_BLOCKSIZE until you really know what you are doing !!!
 #define SPARE_RAM 252*1024*1024 // the last 4 MB is enough...
@@ -186,6 +191,11 @@ static int stb_supports_uhd_grab_buffers(void)
 	       stb_type == BRCM7439DAGS ||
 	       stb_type == BRCM72604 ||
 	       stb_type == BRCM72604VU;
+}
+
+static int e2egl_capture_available(void)
+{
+	return access(E2EGL_CAPTURE_SOCKET, F_OK) == 0;
 }
 
 static int chr_luma_stride = 0x40;
@@ -1960,7 +1970,7 @@ int main(int argc, char **argv)
 					"-i (video device) to grab video (default 0)\n"
 					"-d always use osd resolution (good for skinshots)\n"
 					"-n dont correct 16:9 aspect ratio\n"
-					"-r (size) resize to a fixed width, maximum: 1920, 3840 on DreamNextGen\n"
+					"-r (size) resize to a fixed width, maximum: 1920, 3840 on e2egl/UHD boxes\n"
 					"-l always 4:3, create letterbox if 16:9\n"
 					"-b use bicubic picture resize (slow but smooth)\n"
 					"-j (quality) produce jpg files instead of bmp (quality 0-100)\n"
@@ -1992,7 +2002,7 @@ int main(int argc, char **argv)
 			case 'r': // use given resolution
 				width=atoi(optarg);
 				{
-					int max_resize_width = stb_supports_uhd_grab_buffers() ? 3840 : 1920;
+					int max_resize_width = (stb_supports_uhd_grab_buffers() || e2egl_capture_available()) ? 3840 : 1920;
 					if (width > max_resize_width)
 					{
 						fprintf(stderr, "Error: -r (size) is limited to %d pixels!\n", max_resize_width);
@@ -2054,8 +2064,8 @@ int main(int argc, char **argv)
 
 	size_t mallocsize = 1920U * 1080U;
 
-	if (stb_supports_uhd_grab_buffers())
-		mallocsize = 3840U * 2160U;
+	if (e2egl_capture_available() || stb_supports_uhd_grab_buffers())
+		mallocsize = E2EGL_CAPTURE_MAX_PIXELS;
 	else if (stb_type == VULCAN || stb_type == PALLAS)
 		mallocsize = 720U * 576U;
 
@@ -2098,6 +2108,22 @@ int main(int argc, char **argv)
 	// get osd
 	if (!video_only && !hisi_composited_all)
 		getosd(osd,&xres_o,&yres_o);
+
+	if (!video_only && !hisi_composited_all && (xres_o <= 0 || yres_o <= 0))
+	{
+		if (osd_only)
+		{
+			fprintf(stderr, "OSD grab failed or returned empty frame; not writing a fake 0x0 image\n");
+			free(video);
+			free(osd);
+			free(output);
+			if (hisi_lib_msp)    dlclose(hisi_lib_msp);
+			if (hisi_lib_common) dlclose(hisi_lib_common);
+			return 1;
+		}
+		fprintf(stderr, "OSD grab failed or returned empty frame; falling back to video-only screenshot\n");
+		video_only = 1;
+	}
 
 	// get video
 	if (!osd_only)
@@ -4862,9 +4888,6 @@ dmerr:
 	free(chroma);
 }
 
-#define E2EGL_CAPTURE_SOCKET "/tmp/e2egl-osd.socket"
-#define E2EGL_CAPTURE_FORMAT_BGRA 1U
-
 static const char e2egl_capture_magic[8] = {'E', '2', 'E', 'G', 'L', '0', '1', 0};
 
 struct e2egl_capture_header
@@ -4924,24 +4947,24 @@ static int getosd_e2egl(unsigned char *osd, int *xres, int *yres)
 		if (!quiet)
 			fprintf(stderr, "e2egl OSD capture failed: no header\n");
 		close(fd);
-		return 0;
+		return -1;
 	}
 
 	const size_t width = (size_t)header.width;
 	const size_t height = (size_t)header.height;
 	const size_t stride = (size_t)header.stride;
-	const size_t max_pixels = stb_supports_uhd_grab_buffers() ? 3840U * 2160U : 1920U * 1080U;
+	const size_t max_pixels = E2EGL_CAPTURE_MAX_PIXELS;
 
 	if (memcmp(header.magic, e2egl_capture_magic, sizeof(header.magic)) ||
 	    header.format != E2EGL_CAPTURE_FORMAT_BGRA ||
 	    width == 0 || height == 0 ||
-	    width > 3840U || height > 2160U)
+	    width > E2EGL_CAPTURE_MAX_WIDTH || height > E2EGL_CAPTURE_MAX_HEIGHT)
 	{
 		if (!quiet)
 			fprintf(stderr, "e2egl OSD capture failed: invalid header %zux%zu stride=%zu format=%u\n",
 				width, height, stride, header.format);
 		close(fd);
-		return 0;
+		return -1;
 	}
 
 	const size_t row_bytes = width * 4U;
@@ -4953,7 +4976,7 @@ static int getosd_e2egl(unsigned char *osd, int *xres, int *yres)
 			fprintf(stderr, "e2egl OSD capture failed: invalid geometry %zux%zu stride=%zu\n",
 				width, height, stride);
 		close(fd);
-		return 0;
+		return -1;
 	}
 
 	if (stride == row_bytes)
@@ -4963,7 +4986,7 @@ static int getosd_e2egl(unsigned char *osd, int *xres, int *yres)
 			if (!quiet)
 				fprintf(stderr, "e2egl OSD capture failed: short image\n");
 			close(fd);
-			return 0;
+			return -1;
 		}
 	}
 	else
@@ -4972,7 +4995,7 @@ static int getosd_e2egl(unsigned char *osd, int *xres, int *yres)
 		if (!row)
 		{
 			close(fd);
-			return 0;
+			return -1;
 		}
 		for (size_t y = 0; y < height; ++y)
 		{
@@ -4982,7 +5005,7 @@ static int getosd_e2egl(unsigned char *osd, int *xres, int *yres)
 					fprintf(stderr, "e2egl OSD capture failed: short image row\n");
 				free(row);
 				close(fd);
-				return 0;
+				return -1;
 			}
 			memcpy(osd + y * row_bytes, row, row_bytes);
 		}
@@ -5005,9 +5028,17 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 	unsigned char *lfb;
 	struct fb_fix_screeninfo fix_screeninfo;
 	struct fb_var_screeninfo var_screeninfo;
+	int e2egl_result;
 
-	if (getosd_e2egl(osd, xres, yres))
+	e2egl_result = getosd_e2egl(osd, xres, yres);
+	if (e2egl_result > 0)
 		return;
+	if (e2egl_result < 0)
+	{
+		*xres = 0;
+		*yres = 0;
+		return;
+	}
 
 	fb=open(stb_type == WETEK ? "/dev/fb/2" : "/dev/fb/0", O_RDWR);
 	if (fb == -1)
