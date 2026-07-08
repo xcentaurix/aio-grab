@@ -1087,6 +1087,29 @@ static void grab_make_ffmpeg_scale_fast(char *dst, size_t dst_len, int out_w, in
 		snprintf(dst, dst_len, "scale=%d:%d:flags=fast_bilinear,format=bgr24", out_w, out_h);
 }
 
+/*
+ * -extension_picky is a private AVOption of ffmpeg's HLS demuxer.  Passing it
+ * for a non-HLS input (a plain DVB/IPTV .ts or .mp4 URL) makes ffmpeg abort
+ * with "Unrecognized option" before it even probes the input, so only add it
+ * when the input actually looks like an .m3u8 playlist.
+ */
+static int grab_input_is_hls(const char *input)
+{
+	const char *q;
+	size_t path_len;
+
+	if (!input)
+		return 0;
+
+	q = strchr(input, '?');
+	path_len = q ? (size_t)(q - input) : strlen(input);
+
+	if (path_len < 5)
+		return 0;
+
+	return !strncasecmp(input + path_len - 5, ".m3u8", 5);
+}
+
 static int grab_run_argv_capture_stdout(char *const argv[], unsigned char *buf, size_t need)
 {
 	int pipefd[2];
@@ -1192,14 +1215,17 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 	argv[n++] = "-an";
 	argv[n++] = "-sn";
 	argv[n++] = "-dn";
-	/* Some IPTV SSAI providers (e.g. Rakuten/Xumo ad-stitched HLS) wrap segment
-	 * URIs behind analytics beacon redirects that do not end in a recognized
-	 * media extension.  ffmpeg's HLS demuxer rejects those by default
-	 * ("is not in allowed_segment_extensions"), which makes every variant look
-	 * empty and fails stream mapping.  Disable the extension allow-list check
-	 * for this input; the demuxer still requires valid HLS/segment content. */
-	argv[n++] = "-extension_picky";
-	argv[n++] = "0";
+	if (grab_input_is_hls(input))
+	{
+		/* Some IPTV SSAI providers (e.g. Rakuten/Xumo ad-stitched HLS) wrap segment
+		 * URIs behind analytics beacon redirects that do not end in a recognized
+		 * media extension.  ffmpeg's HLS demuxer rejects those by default
+		 * ("is not in allowed_segment_extensions"), which makes every variant look
+		 * empty and fails stream mapping.  Disable the extension allow-list check
+		 * for this input; the demuxer still requires valid HLS/segment content. */
+		argv[n++] = "-extension_picky";
+		argv[n++] = "0";
+	}
 	if (frame_mode == GRAB_FFMPEG_FRAME_KEYONLY)
 	{
 		/*
@@ -1323,20 +1349,8 @@ static int grab_ffmpeg_one_video_image(const char *input, const char *out, int o
 	char vf[96];
 	char qbuf[16];
 	const char *codec = grab_ffmpeg_codec_name(use_png, use_jpg);
-	char *argv_jpg[] = {
-		"/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
-		"-extension_picky", "0",
-		"-i", (char *)input,
-		"-vf", vf, "-vframes", "1",
-		"-movflags", "+faststart", "-f", "image2", "-c:v", (char *)codec, "-q:v", qbuf, "-y", (char *)out, NULL
-	};
-	char *argv_other[] = {
-		"/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
-		"-extension_picky", "0",
-		"-i", (char *)input,
-		"-vf", vf, "-vframes", "1",
-		"-movflags", "+faststart", "-f", "image2", "-c:v", (char *)codec, "-y", (char *)out, NULL
-	};
+	char *argv[24];
+	int n = 0;
 
 	if (!codec)
 		return -1;
@@ -1351,21 +1365,47 @@ static int grab_ffmpeg_one_video_image(const char *input, const char *out, int o
 	 * fps=1/2 lets ffmpeg wait for a decodable HEVC frame instead of failing on
 	 * the first packet after joining the live TS. */
 	snprintf(qbuf, sizeof(qbuf), "%d", grab_ffmpeg_quality_arg(jpg_quality));
-	return grab_run_argv(use_jpg ? argv_jpg : argv_other);
+
+	argv[n++] = "/usr/bin/ffmpeg";
+	argv[n++] = "-hide_banner";
+	argv[n++] = "-loglevel";
+	argv[n++] = "error";
+	if (grab_input_is_hls(input))
+	{
+		argv[n++] = "-extension_picky";
+		argv[n++] = "0";
+	}
+	argv[n++] = "-i";
+	argv[n++] = (char *)input;
+	argv[n++] = "-vf";
+	argv[n++] = vf;
+	argv[n++] = "-vframes";
+	argv[n++] = "1";
+	argv[n++] = "-movflags";
+	argv[n++] = "+faststart";
+	argv[n++] = "-f";
+	argv[n++] = "image2";
+	argv[n++] = "-c:v";
+	argv[n++] = (char *)codec;
+	if (use_jpg)
+	{
+		argv[n++] = "-q:v";
+		argv[n++] = qbuf;
+	}
+	argv[n++] = "-y";
+	argv[n++] = (char *)out;
+	argv[n++] = NULL;
+
+	return grab_run_argv(argv);
 }
 
 static int grab_ffmpeg_one_video_bmp(const char *input, const char *out, int out_w, int out_h)
 {
 	char vf[96];
 	char raw_tmp[128];
+	char *argv[20];
+	int n = 0;
 	int ret;
-	char *argv[] = {
-		"/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
-		"-extension_picky", "0",
-		"-i", (char *)input,
-		"-vf", vf, "-vframes", "1",
-		"-f", "rawvideo", "-pix_fmt", "bgr24", "-y", raw_tmp, NULL
-	};
 
 	if (out_w <= 0)
 		out_w = 1920;
@@ -1377,6 +1417,29 @@ static int grab_ffmpeg_one_video_bmp(const char *input, const char *out, int out
 	grab_make_ffmpeg_scale(vf, sizeof(vf), out_w, out_h, 1);
 	snprintf(raw_tmp, sizeof(raw_tmp), "/tmp/grab-ffmpeg-%ld-video.bgr", (long)getpid());
 	unlink(raw_tmp);
+
+	argv[n++] = "/usr/bin/ffmpeg";
+	argv[n++] = "-hide_banner";
+	argv[n++] = "-loglevel";
+	argv[n++] = "error";
+	if (grab_input_is_hls(input))
+	{
+		argv[n++] = "-extension_picky";
+		argv[n++] = "0";
+	}
+	argv[n++] = "-i";
+	argv[n++] = (char *)input;
+	argv[n++] = "-vf";
+	argv[n++] = vf;
+	argv[n++] = "-vframes";
+	argv[n++] = "1";
+	argv[n++] = "-f";
+	argv[n++] = "rawvideo";
+	argv[n++] = "-pix_fmt";
+	argv[n++] = "bgr24";
+	argv[n++] = "-y";
+	argv[n++] = raw_tmp;
+	argv[n++] = NULL;
 
 	ret = grab_run_argv(argv);
 	if (ret == 0)
