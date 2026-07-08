@@ -1211,7 +1211,7 @@ static int grab_run_argv_capture_stdout(char *const argv[], unsigned char *buf, 
 	return 0;
 }
 
-static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *video, int out_w, int out_h, int frame_mode)
+static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *video, int out_w, int out_h, int frame_mode, int force_extension_picky)
 {
 	char vf[128];
 	const char *loglevel = grab_ffmpeg_loglevel();
@@ -1241,14 +1241,17 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 	argv[n++] = "-an";
 	argv[n++] = "-sn";
 	argv[n++] = "-dn";
-	if (grab_input_is_hls(input))
+	if (grab_input_is_hls(input) || force_extension_picky)
 	{
 		/* Some IPTV SSAI providers (e.g. Rakuten/Xumo ad-stitched HLS) wrap segment
 		 * URIs behind analytics beacon redirects that do not end in a recognized
 		 * media extension.  ffmpeg's HLS demuxer rejects those by default
 		 * ("is not in allowed_segment_extensions"), which makes every variant look
 		 * empty and fails stream mapping.  Disable the extension allow-list check
-		 * for this input; the demuxer still requires valid HLS/segment content. */
+		 * for this input; the demuxer still requires valid HLS/segment content.
+		 * force_extension_picky is set when the caller is retrying an input that
+		 * doesn't visibly look like HLS (e.g. an opaque jmp2.uk-style redirector
+		 * URL with no ".m3u8" in it) after a plain attempt already failed. */
 		argv[n++] = "-extension_picky";
 		argv[n++] = "0";
 	}
@@ -1333,25 +1336,39 @@ static int grab_ffmpeg_getvideo_frame(unsigned char *video, int *xres, int *yres
 		 */
 		if (!quiet)
 			fprintf(stderr, "ffmpeg backend: HEVC DVB stream, waiting for next key frame\n");
-		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_KEYONLY);
+		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_KEYONLY, 0);
 		if (ret < 0)
 		{
 			if (!quiet)
 				fprintf(stderr, "ffmpeg backend: key-frame grab failed, retrying with fps=1/2 wait mode\n");
-			ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_WAIT);
+			ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_WAIT, 0);
 		}
 	}
 	else
 	{
 		/* Fast path first: no fps=1/2 throttle.  If the live join starts before
 		 * a clean access unit, retry once with the slower DreamOS-style wait filter. */
-		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_FAST);
+		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_FAST, 0);
 		if (ret < 0)
 		{
 			if (!quiet)
 				fprintf(stderr, "ffmpeg backend: fast frame failed, retrying with fps=1/2 wait mode\n");
-			ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_WAIT);
+			ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_WAIT, 0);
 		}
+	}
+
+	if (ret < 0 && !grab_input_is_hls(input))
+	{
+		/* The input may be an opaque redirector/shortener URL (e.g. a
+		 * jmp2.uk-style link with no visible ".m3u8") whose real target is
+		 * HLS with beacon-wrapped segments, which grab_input_is_hls() can't
+		 * detect up front.  Retry once forcing the extension allow-list off.
+		 * If the input genuinely isn't HLS this attempt fails independently
+		 * (possibly with ffmpeg's own "Unrecognized option" for a private
+		 * HLS option), which is no worse than the failure already in ret. */
+		if (!quiet)
+			fprintf(stderr, "ffmpeg backend: retrying in case input is HLS behind a redirector (extension_picky off)\n");
+		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_WAIT, 1);
 	}
 
 	if (ret == 0)
@@ -1370,7 +1387,7 @@ static void grab_make_ffmpeg_scale(char *dst, size_t dst_len, int out_w, int out
 		snprintf(dst, dst_len, "fps=1/2,scale=%d:%d", out_w, out_h);
 }
 
-static int grab_ffmpeg_one_video_image(const char *input, const char *out, int out_w, int out_h, int use_png, int use_jpg, int jpg_quality)
+static int grab_ffmpeg_one_video_image_try(const char *input, const char *out, int out_w, int out_h, int use_png, int use_jpg, int jpg_quality, int force_extension_picky)
 {
 	char vf[96];
 	char qbuf[16];
@@ -1380,12 +1397,6 @@ static int grab_ffmpeg_one_video_image(const char *input, const char *out, int o
 
 	if (!codec)
 		return -1;
-	if (out_w <= 0)
-		out_w = 1920;
-	if (out_h <= 0)
-		out_h = (out_w * 9) / 16;
-	if (out_h & 1)
-		out_h++;
 	grab_make_ffmpeg_scale(vf, sizeof(vf), out_w, out_h, 0);
 	/* Match DreamOS FreezeFrame behaviour on armhf: no tiny analyzeduration/probesize.
 	 * fps=1/2 lets ffmpeg wait for a decodable HEVC frame instead of failing on
@@ -1396,7 +1407,7 @@ static int grab_ffmpeg_one_video_image(const char *input, const char *out, int o
 	argv[n++] = "-hide_banner";
 	argv[n++] = "-loglevel";
 	argv[n++] = "error";
-	if (grab_input_is_hls(input))
+	if (grab_input_is_hls(input) || force_extension_picky)
 	{
 		argv[n++] = "-extension_picky";
 		argv[n++] = "0";
@@ -1425,12 +1436,8 @@ static int grab_ffmpeg_one_video_image(const char *input, const char *out, int o
 	return grab_run_argv(argv);
 }
 
-static int grab_ffmpeg_one_video_bmp(const char *input, const char *out, int out_w, int out_h)
+static int grab_ffmpeg_one_video_image(const char *input, const char *out, int out_w, int out_h, int use_png, int use_jpg, int jpg_quality)
 {
-	char vf[96];
-	char raw_tmp[128];
-	char *argv[20];
-	int n = 0;
 	int ret;
 
 	if (out_w <= 0)
@@ -1440,15 +1447,29 @@ static int grab_ffmpeg_one_video_bmp(const char *input, const char *out, int out
 	if (out_h & 1)
 		out_h++;
 
-	grab_make_ffmpeg_scale(vf, sizeof(vf), out_w, out_h, 1);
-	snprintf(raw_tmp, sizeof(raw_tmp), "/tmp/grab-ffmpeg-%ld-video.bgr", (long)getpid());
-	unlink(raw_tmp);
+	ret = grab_ffmpeg_one_video_image_try(input, out, out_w, out_h, use_png, use_jpg, jpg_quality, 0);
+	if (ret < 0 && !grab_input_is_hls(input))
+	{
+		/* Input may be an opaque redirector URL (no visible ".m3u8") whose
+		 * real target is HLS with beacon-wrapped segments; see the matching
+		 * retry in grab_ffmpeg_getvideo_frame(). */
+		if (!quiet)
+			fprintf(stderr, "ffmpeg backend: retrying in case input is HLS behind a redirector (extension_picky off)\n");
+		ret = grab_ffmpeg_one_video_image_try(input, out, out_w, out_h, use_png, use_jpg, jpg_quality, 1);
+	}
+	return ret;
+}
+
+static int grab_ffmpeg_one_video_bmp_try(const char *input, const char *raw_tmp, char *vf, int force_extension_picky)
+{
+	char *argv[20];
+	int n = 0;
 
 	argv[n++] = "/usr/bin/ffmpeg";
 	argv[n++] = "-hide_banner";
 	argv[n++] = "-loglevel";
 	argv[n++] = "error";
-	if (grab_input_is_hls(input))
+	if (grab_input_is_hls(input) || force_extension_picky)
 	{
 		argv[n++] = "-extension_picky";
 		argv[n++] = "0";
@@ -1464,10 +1485,36 @@ static int grab_ffmpeg_one_video_bmp(const char *input, const char *out, int out
 	argv[n++] = "-pix_fmt";
 	argv[n++] = "bgr24";
 	argv[n++] = "-y";
-	argv[n++] = raw_tmp;
+	argv[n++] = (char *)raw_tmp;
 	argv[n++] = NULL;
 
-	ret = grab_run_argv(argv);
+	return grab_run_argv(argv);
+}
+
+static int grab_ffmpeg_one_video_bmp(const char *input, const char *out, int out_w, int out_h)
+{
+	char vf[96];
+	char raw_tmp[128];
+	int ret;
+
+	if (out_w <= 0)
+		out_w = 1920;
+	if (out_h <= 0)
+		out_h = (out_w * 9) / 16;
+	if (out_h & 1)
+		out_h++;
+
+	grab_make_ffmpeg_scale(vf, sizeof(vf), out_w, out_h, 1);
+	snprintf(raw_tmp, sizeof(raw_tmp), "/tmp/grab-ffmpeg-%ld-video.bgr", (long)getpid());
+	unlink(raw_tmp);
+
+	ret = grab_ffmpeg_one_video_bmp_try(input, raw_tmp, vf, 0);
+	if (ret < 0 && !grab_input_is_hls(input))
+	{
+		if (!quiet)
+			fprintf(stderr, "ffmpeg backend: retrying in case input is HLS behind a redirector (extension_picky off)\n");
+		ret = grab_ffmpeg_one_video_bmp_try(input, raw_tmp, vf, 1);
+	}
 	if (ret == 0)
 		ret = grab_raw_bgr24_file_to_bmp(raw_tmp, out, out_w, out_h);
 	unlink(raw_tmp);
