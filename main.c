@@ -1075,9 +1075,13 @@ static const char *grab_ffmpeg_loglevel(void)
 	return "fatal";
 }
 
-static void grab_make_ffmpeg_scale_fast(char *dst, size_t dst_len, int out_w, int out_h, int wait_for_clean_frame)
+#define GRAB_FFMPEG_FRAME_FAST     0
+#define GRAB_FFMPEG_FRAME_WAIT     1
+#define GRAB_FFMPEG_FRAME_KEYONLY  2
+
+static void grab_make_ffmpeg_scale_fast(char *dst, size_t dst_len, int out_w, int out_h, int frame_mode)
 {
-	if (wait_for_clean_frame)
+	if (frame_mode == GRAB_FFMPEG_FRAME_WAIT)
 		snprintf(dst, dst_len, "fps=1/2,scale=%d:%d:flags=fast_bilinear,format=bgr24", out_w, out_h);
 	else
 		snprintf(dst, dst_len, "scale=%d:%d:flags=fast_bilinear,format=bgr24", out_w, out_h);
@@ -1158,12 +1162,12 @@ static int grab_run_argv_capture_stdout(char *const argv[], unsigned char *buf, 
 	return 0;
 }
 
-static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *video, int out_w, int out_h, int wait_for_clean_frame)
+static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *video, int out_w, int out_h, int frame_mode)
 {
 	char vf[128];
 	const char *loglevel = grab_ffmpeg_loglevel();
 	size_t need;
-	char *argv[32];
+	char *argv[36];
 	int n = 0;
 
 	if (!input || !video || out_w <= 0 || out_h <= 0 || out_w > 1920 || out_h > 1080)
@@ -1173,7 +1177,7 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 	if (need == 0 || need > 1920U * 1080U * 3U)
 		return -1;
 
-	grab_make_ffmpeg_scale_fast(vf, sizeof(vf), out_w, out_h, wait_for_clean_frame);
+	grab_make_ffmpeg_scale_fast(vf, sizeof(vf), out_w, out_h, frame_mode);
 
 	argv[n++] = "/usr/bin/ffmpeg";
 	argv[n++] = "-hide_banner";
@@ -1188,6 +1192,18 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 	argv[n++] = "-an";
 	argv[n++] = "-sn";
 	argv[n++] = "-dn";
+	if (frame_mode == GRAB_FFMPEG_FRAME_KEYONLY)
+	{
+		/*
+		 * Some Dream HEVC services, especially 8-bit DVB HD services, start the
+		 * live/recorded TS join on P frames before ffmpeg has usable reference
+		 * pictures.  ffmpeg may still output a complete but grey/black corrupted
+		 * frame, so the normal fast path appears successful.  Decode only the next
+		 * key frame for HEVC to get the first independently decodable image.
+		 */
+		argv[n++] = "-skip_frame";
+		argv[n++] = "nokey";
+	}
 	argv[n++] = "-i";
 	argv[n++] = (char *)input;
 	argv[n++] = "-map";
@@ -1246,14 +1262,36 @@ static int grab_ffmpeg_getvideo_frame(unsigned char *video, int *xres, int *yres
 	if (!quiet)
 		fprintf(stderr, "ffmpeg backend: input=<stream-url> output=%dx%d target=internal-bgr24%s\n", out_w, out_h, grab_ffmpeg_http_headers[0] ? " headers=yes" : "");
 
-	/* Fast path first: no fps=1/2 throttle.  If the live HEVC join starts before
-	 * a clean access unit, retry once with the slower DreamOS-style wait filter. */
-	ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, 0);
-	if (ret < 0)
+	if (grab_current_video_is_hevc() && !grab_current_service_is_iptv())
 	{
+		/*
+		 * DVB HEVC can output a syntactically complete but visually corrupted
+		 * first frame when the grab starts before the next random access point.
+		 * VLC hides this by waiting for a usable reference/key frame.  Do the same
+		 * for Dream HEVC DVB captures.  IPTV stays on the faster path because the
+		 * direct URL probe already produced correct frames there.
+		 */
 		if (!quiet)
-			fprintf(stderr, "ffmpeg backend: fast frame failed, retrying with fps=1/2 wait mode\n");
-		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, 1);
+			fprintf(stderr, "ffmpeg backend: HEVC DVB stream, waiting for next key frame\n");
+		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_KEYONLY);
+		if (ret < 0)
+		{
+			if (!quiet)
+				fprintf(stderr, "ffmpeg backend: key-frame grab failed, retrying with fps=1/2 wait mode\n");
+			ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_WAIT);
+		}
+	}
+	else
+	{
+		/* Fast path first: no fps=1/2 throttle.  If the live join starts before
+		 * a clean access unit, retry once with the slower DreamOS-style wait filter. */
+		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_FAST);
+		if (ret < 0)
+		{
+			if (!quiet)
+				fprintf(stderr, "ffmpeg backend: fast frame failed, retrying with fps=1/2 wait mode\n");
+			ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_WAIT);
+		}
 	}
 
 	if (ret == 0)
