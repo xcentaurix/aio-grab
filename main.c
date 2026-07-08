@@ -387,6 +387,27 @@ static void grab_percent_decode_repeat_inplace(char *s, int rounds)
 	}
 }
 
+/*
+ * Collapse only the "%25" -> "%" wrapping layer, in place, repeatedly.
+ *
+ * OpenWebif can wrap an already-encoded IPTV service reference in one more
+ * layer of percent-encoding when it serializes it into XML (turning the
+ * URL's own "%3a" scheme/field colons into "%253a").  Unlike
+ * grab_percent_decode_repeat_inplace(), this does not touch a genuine
+ * single-encoded "%3a" (or any other %XX that is not part of a "%25"
+ * sequence), so it normalizes away that extra transport-layer wrapping
+ * without destroying the encoded-vs-literal-colon distinction that
+ * grab_extract_embedded_stream_url() relies on to find the end of the URL.
+ */
+static void grab_collapse_percent25_inplace(char *s)
+{
+	char *p;
+	if (!s)
+		return;
+	while ((p = strstr(s, "%25")) != NULL)
+		memmove(p + 1, p + 3, strlen(p + 3) + 1);
+}
+
 static void grab_xml_unescape_inplace(char *s)
 {
 	char *d = s;
@@ -685,12 +706,17 @@ static int grab_extract_embedded_stream_url(const char *sref, char *out, size_t 
 		return -1;
 
 	/* OpenWebif can return IPTV service references double-encoded, for example
-	 * http%253a//host%253a8080/... .  Decode a copy repeatedly before looking
-	 * for the embedded URL so we do not accidentally fall back to
-	 * http://127.0.0.1:8001/<whole service reference>. */
+	 * http%253a//host%253a8080/... .  Collapse away only that extra "%25"
+	 * transport-layer wrapping here, not a full percent-decode: the enigma2
+	 * reference format depends on the URL's own colons staying encoded
+	 * ("%3a") so that a literal, unencoded ':' unambiguously marks the
+	 * end-of-URL / service-name separator.  Some SSAI ad-tracking providers
+	 * embed a literal ':' in their own query parameter names (e.g.
+	 * "ads:foo=..."), which decoding too early would make indistinguishable
+	 * from that separator and truncate the URL mid-query-string. */
 	snprintf(work, sizeof(work), "%s", sref);
 	grab_xml_unescape_inplace(work);
-	grab_percent_decode_repeat_inplace(work, 4);
+	grab_collapse_percent25_inplace(work);
 
 	p = grab_find_earliest_url_marker(work, &encoded);
 	if (!p)
