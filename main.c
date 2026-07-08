@@ -1192,6 +1192,14 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 	argv[n++] = "-an";
 	argv[n++] = "-sn";
 	argv[n++] = "-dn";
+	/* Some IPTV SSAI providers (e.g. Rakuten/Xumo ad-stitched HLS) wrap segment
+	 * URIs behind analytics beacon redirects that do not end in a recognized
+	 * media extension.  ffmpeg's HLS demuxer rejects those by default
+	 * ("is not in allowed_segment_extensions"), which makes every variant look
+	 * empty and fails stream mapping.  Disable the extension allow-list check
+	 * for this input; the demuxer still requires valid HLS/segment content. */
+	argv[n++] = "-extension_picky";
+	argv[n++] = "0";
 	if (frame_mode == GRAB_FFMPEG_FRAME_KEYONLY)
 	{
 		/*
@@ -1317,12 +1325,14 @@ static int grab_ffmpeg_one_video_image(const char *input, const char *out, int o
 	const char *codec = grab_ffmpeg_codec_name(use_png, use_jpg);
 	char *argv_jpg[] = {
 		"/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-extension_picky", "0",
 		"-i", (char *)input,
 		"-vf", vf, "-vframes", "1",
 		"-movflags", "+faststart", "-f", "image2", "-c:v", (char *)codec, "-q:v", qbuf, "-y", (char *)out, NULL
 	};
 	char *argv_other[] = {
 		"/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-extension_picky", "0",
 		"-i", (char *)input,
 		"-vf", vf, "-vframes", "1",
 		"-movflags", "+faststart", "-f", "image2", "-c:v", (char *)codec, "-y", (char *)out, NULL
@@ -1351,6 +1361,7 @@ static int grab_ffmpeg_one_video_bmp(const char *input, const char *out, int out
 	int ret;
 	char *argv[] = {
 		"/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-extension_picky", "0",
 		"-i", (char *)input,
 		"-vf", vf, "-vframes", "1",
 		"-f", "rawvideo", "-pix_fmt", "bgr24", "-y", raw_tmp, NULL
